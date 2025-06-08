@@ -1,0 +1,14 @@
+# --- Core Libraries ---
+pandas
+numpy
+scikit-learn
+joblib
+
+# --- Forecasting ---
+prophet
+tensorflow # For the LSTM model
+cmdstanpy
+
+# --- Utilities ---
+PyYAML # For reading the config file
+plotly

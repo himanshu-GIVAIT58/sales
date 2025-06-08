@@ -1,0 +1,50 @@
+# ----------------------------------------------------
+# Configuration for the SKU Forecasting Pipeline
+# ----------------------------------------------------
+
+# --- File Paths ---
+paths:
+  sales_data: "./home/jupyter/sales_data_complete___daily_drill_down_2025-05-29T12_37_43.113222731+05_30.csv"
+  inventory_data: "./home/jupyter/query_result_2025-05-28T18_02_43.550629445+05_30.csv"
+  holidays_data: "./home/jupyter/indian_holidays.csv"
+  output_summary: "./home/jupyter/multi_sku_forecasting_final.csv"
+  output_daily: "./home/jupyter/daily_forecasts_final.csv"
+  model_directory: "./home/jupyter/saved_models"
+  log_file: "./home/jupyter/forecasting_log.txt"
+
+# --- Execution Settings ---
+execution:
+  max_skus_to_process: 100
+  # Use 0 for auto-detection of CPU cores
+  max_workers: 0 
+  min_data_points_for_lstm: 90 # LSTM needs more data than Prophet
+  min_data_points_for_prophet: 30
+  validation_days: 30 # Days to hold out for model comparison
+  forecast_horizon_days: 183
+  # If LSTM's error is this much worse than Prophet's, use Prophet only
+  ensemble_fallback_threshold: 1.15 # (i.e., 15% worse)
+
+# --- Prophet Model Settings ---
+prophet:
+  changepoint_prior_scale: 0.05
+  seasonality_prior_scale: 10.0
+  holidays_prior_scale: 10.0
+  seasonality_mode: 'additive'
+  holiday_types: ['National holiday', 'Optional holiday']
+
+# --- LSTM Model Settings ---
+lstm:
+  n_steps: 30        # How many past days of data to look at for a prediction
+  n_features: 4    # Number of features: y, store_count, was_stocked_out, weekday
+  epochs: 50
+  batch_size: 32
+  dropout_rate: 0.2
+  learning_rate: 0.001
+
+# --- Inventory Metrics Settings (Deterministic) ---
+inventory:
+  avg_lead_time_days: 21
+  moq: 10 # Minimum Order Quantity
+  holding_cost_percentage: 0.10
+  ordering_cost_percentage: 0.30
+  service_level: 0.95
