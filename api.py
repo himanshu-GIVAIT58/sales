@@ -77,11 +77,9 @@ def load_models_and_data():
     logger.info(f"--- Startup complete. {len(MODELS)} models loaded successfully. ---")
 
 
-# --- API Data Models (using Pydantic) ---
-
 class ForecastRequest(BaseModel):
     sku_id: str
-    days_to_forecast: int = 30 # Default to 30 days
+    days_to_forecast: int = 30 
 
 class Forecast(BaseModel):
     date: str
@@ -91,9 +89,6 @@ class ForecastResponse(BaseModel):
     sku_id: str
     model_type: str
     forecast: list[Forecast]
-
-
-# --- API Endpoints ---
 
 @app.get("/", tags=["Health Check"])
 def read_root():
@@ -109,8 +104,7 @@ def get_prediction(request: ForecastRequest):
     days = request.days_to_forecast
 
     logger.info(f"Received prediction request for SKU: {sku_id} for {days} days.")
-
-    # 1. Check if model for the given SKU exists
+  
     if sku_id not in MODELS:
         raise HTTPException(status_code=404, detail=f"SKU '{sku_id}' not found. No trained model available.")
 
