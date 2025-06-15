@@ -1,14 +1,28 @@
-# --- Core Libraries ---
-pandas
+
 numpy
 scikit-learn
 joblib
+optuna
 
-# --- Forecasting ---
+tensorflow
+keras-tuner
+
 prophet
-tensorflow # For the LSTM model
-cmdstanpy
+xgboost
 
-# --- Utilities ---
-PyYAML # For reading the config file
-plotly
+API
+fastapi
+uvicorn[standard]
+
+
+streamlit
+streamlit-chat
+altair
+
+
+google-generativeai
+
+
+python-dotenv
+pyyaml
+requests

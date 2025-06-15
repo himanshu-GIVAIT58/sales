@@ -1,10 +1,10 @@
+# preprocess.py
+
 import pandas as pd
 import numpy as np
-import re
-import logging
 
-def clean_numeric(value):
-    """Clean string to extract numeric value."""
+def clean_numeric(value: any) -> float:
+    """Cleans and converts a value to a float, handling various formats."""
     if pd.isna(value): return np.nan
     if isinstance(value, (int, float)): return float(value)
     value = str(value).strip()
@@ -14,102 +14,65 @@ def clean_numeric(value):
     except (ValueError, TypeError):
         return np.nan
 
-def create_store_growth_features(df: pd.DataFrame, future_days: int) -> pd.DataFrame:
-    """Creates a DataFrame with projected store counts for historical and future dates."""
-    if 'created_at' not in df.columns or df['created_at'].isnull().all():
-        logging.error("Cannot create store growth features: 'created_at' column is missing or empty.")
-        # Return a simple dataframe to avoid crashing
-        return pd.DataFrame({'created_at': pd.to_datetime([]), 'store_count': []})
+def create_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Creates time-series features for the model.
 
-    start_date = df['created_at'].min()
-    end_date = df['created_at'].max()
-    future_end_date = end_date + pd.DateOffset(days=future_days)
-    full_date_range = pd.date_range(start_date, future_end_date, freq='D')
-    
-    store_growth_df = pd.DataFrame({'created_at': full_date_range})
-    
-    # Example growth logic (can be made more sophisticated)
-    initial_stores, historical_growth, future_growth = 100, 5, 10
-    
-    store_growth_df['month_diff'] = ((store_growth_df['created_at'].dt.year - start_date.year) * 12 +
-                                     (store_growth_df['created_at'].dt.month - start_date.month))
-    store_growth_df['store_count'] = initial_stores + (store_growth_df['month_diff'] * historical_growth)
-    
-    future_mask = store_growth_df['created_at'] > end_date
-    month_diff_future = ((store_growth_df.loc[future_mask, 'created_at'].dt.year - end_date.year) * 12 +
-                         (store_growth_df.loc[future_mask, 'created_at'].dt.month - end_date.month))
-    
-    last_historical_count = store_growth_df.loc[~future_mask, 'store_count'].iloc[-1]
-    store_growth_df.loc[future_mask, 'store_count'] = last_historical_count + (month_diff_future * future_growth)
-    
-    return store_growth_df[['created_at', 'store_count']]
+    Args:
+        df (pd.DataFrame): The input DataFrame.
 
+    Returns:
+        pd.DataFrame: DataFrame with new features.
+    """
+    df['discount_percentage'] = (df['disc'] / (df['revenue'] + df['disc'])).fillna(0) if (df['revenue'] + df['disc']).sum() > 0 else 0
+    df['is_on_promotion'] = (df['disc'] > 0).astype(int)
+    df['is_month_start'] = df['ds'].dt.is_month_start.astype(int)
+    df['is_month_end'] = df['ds'].dt.is_month_end.astype(int)
+    for lag in [1, 7, 14, 30]:
+        df[f'sales_lag_{lag}d'] = df['y'].shift(lag).fillna(0)
+    df['rolling_avg_sales_7d'] = df['y'].shift(1).rolling(window=7, min_periods=1).mean().fillna(0)
+    df['rolling_std_sales_7d'] = df['y'].shift(1).rolling(window=7, min_periods=1).std().fillna(0)
+    df['day_of_week_sin'] = np.sin(2 * np.pi * df['ds'].dt.dayofweek / 7)
+    df['day_of_week_cos'] = np.cos(2 * np.pi * df['ds'].dt.dayofweek / 7)
+    df['month_sin'] = np.sin(2 * np.pi * df['ds'].dt.month / 12)
+    df['month_cos'] = np.cos(2 * np.pi * df['ds'].dt.month / 12)
+    return df
 
-def prepare_data(sales_df: pd.DataFrame, inventory_df: pd.DataFrame, holidays_df: pd.DataFrame, config: dict) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """Orchestrates the full data preparation and feature engineering pipeline."""
-    logging.info("Starting data preparation...")
-    
-    # Clean sales data
-    for col in ['revenue', 'disc', 'qty']:
-        if col in sales_df.columns:
-            sales_df[col] = sales_df[col].apply(clean_numeric)
-    sales_df.dropna(subset=['qty', 'revenue'], inplace=True)
-    sales_df['created_at'] = pd.to_datetime(sales_df['created_at'], errors='coerce', dayfirst=True).dt.normalize()
-    sales_df.dropna(subset=['created_at', 'sku'], inplace=True)
+def prepare_sku_data(sku_df: pd.DataFrame, store_growth_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Prepares and cleans the data for a single SKU.
 
-    # Prepare and merge inventory data
-    inventory_df.rename(columns={'date': 'created_at'}, inplace=True)
-    inventory_df['created_at'] = pd.to_datetime(inventory_df['created_at'], errors='coerce').dt.normalize()
-    inventory_df.dropna(subset=['created_at', 'sku'], inplace=True)
-    inventory_agg = inventory_df.groupby(['created_at', 'sku']).agg({'wh': 'sum'}).reset_index()
-    sales_df = pd.merge(sales_df, inventory_agg, on=['created_at', 'sku'], how='left')
-    sales_df['was_stocked_out'] = (sales_df['wh'] == 0).astype(int)
-    sales_df['wh'] = sales_df['wh'].ffill().bfill().fillna(0)
+    Args:
+        sku_df (pd.DataFrame): The raw data for a single SKU.
+        store_growth_df (pd.DataFrame): DataFrame with store growth information.
 
-    # Feature Engineering
-    sales_df['unit_price'] = (sales_df['revenue'] / sales_df['qty']).replace([np.inf, -np.inf], np.nan)
-    sales_df['unit_price'].fillna(sales_df.groupby('sku')['unit_price'].transform('median'), inplace=True)
-    sales_df['unit_price'].fillna(sales_df['unit_price'].median(), inplace=True)
-    
-    sales_df['weekday'] = sales_df['created_at'].dt.dayofweek
-    sales_df['is_weekend'] = sales_df['weekday'].isin([5, 6]).astype(int)
+    Returns:
+        pd.DataFrame: A cleaned and feature-engineered DataFrame ready for modeling.
+    """
+    # Merge store growth data
+    sku_df = sku_df.merge(store_growth_df, on='created_at', how='left')
+    sku_df['store_count'] = sku_df['store_count'].ffill().bfill()
 
-    # Prepare store growth features
-    store_growth_df = create_store_growth_features(sales_df, config['execution']['forecast_horizon_days'])
-    sales_df = pd.merge(sales_df, store_growth_df, on='created_at', how='left')
-    sales_df['store_count'] = sales_df['store_count'].ffill().bfill()
-    
-    # Prepare holidays data
-    holidays_df = holidays_df.rename(columns={'Date': 'ds', 'Name': 'holiday'})
-    holidays_df['ds'] = pd.to_datetime(holidays_df['ds'], errors='coerce', dayfirst=True).dt.normalize()
-    holidays_df = holidays_df[holidays_df['Type'].str.contains('|'.join(config['prophet']['holiday_types']), na=False)]
-    holidays_df = holidays_df[['ds', 'holiday']].drop_duplicates().dropna()
-
-    sales_df.sort_values('created_at', inplace=True)
-    logging.info("Data preparation complete.")
-    return sales_df, holidays_df, store_growth_df
-
-def prepare_sku_specific_data(sku_df: pd.DataFrame) -> pd.DataFrame:
-    """Prepares the final modeling-ready dataframe for a single SKU."""
-    agg_rules = {
-        'qty': 'sum', 
-        'store_count': 'first', 
-        'was_stocked_out': 'max', 
-        'weekday': 'first'
-    }
-    
     # Aggregate data by day
-    model_df = sku_df.groupby(sku_df['created_at']).agg(agg_rules).reset_index()
+    agg_rules = {'qty': 'sum', 'store_count': 'first', 'was_stocked_out': 'max', 'disc': 'sum', 'revenue': 'sum'}
+    model_df = sku_df.groupby('created_at').agg(agg_rules).reset_index()
     model_df.rename(columns={'created_at': 'ds', 'qty': 'y'}, inplace=True)
-    
-    # Ensure all dates are present
-    full_date_range = pd.date_range(start=model_df['ds'].min(), end=model_df['ds'].max(), freq='D')
-    model_df = model_df.set_index('ds').reindex(full_date_range).reset_index().rename(columns={'index': 'ds'})
-    
-    # Forward-fill regressors and fill target with 0 for missing days
-    model_df['store_count'] = model_df['store_count'].ffill()
-    model_df['was_stocked_out'] = model_df['was_stocked_out'].fillna(0)
-    model_df['weekday'] = model_df['ds'].dt.dayofweek
-    model_df['y'] = model_df['y'].fillna(0)
 
+    # Outlier capping using IQR
+    q1, q3 = model_df['y'].quantile([0.25, 0.75])
+    iqr = q3 - q1
+    model_df['y'] = model_df['y'].clip(lower=0, upper=q3 + 1.5 * iqr)
+
+    # Fill missing dates and interpolate values
+    if not model_df.empty:
+        full_date_range = pd.date_range(start=model_df['ds'].min(), end=model_df['ds'].max(), freq='D')
+        model_df = model_df.set_index('ds').reindex(full_date_range).reset_index().rename(columns={'index': 'ds'})
+        model_df['y'] = model_df['y'].interpolate(method='linear').fillna(0)
+        for col in ['store_count', 'was_stocked_out', 'disc', 'revenue']:
+            model_df[col] = model_df[col].ffill().bfill().fillna(0)
+
+    # Create time-series features
+    model_df = create_features(model_df)
+    model_df.sort_values('ds', inplace=True)
+    
     return model_df
