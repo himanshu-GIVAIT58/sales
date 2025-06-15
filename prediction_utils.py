@@ -44,7 +44,7 @@ def create_future_features(history_df, days_to_forecast, store_growth_df):
     
     # The fix is a two-step process: fill the values, then explicitly infer the types.
     future_df_with_features.fillna(0, inplace=True)
-    future_df_with_features = future_df_with_features.infer_objects()
+    future_df_with_features = future_df_with_features.infer_objects(copy=False)
 
     return future_df_with_features
 
