@@ -42,9 +42,9 @@ def create_future_features(history_df, days_to_forecast, store_growth_df):
     # Get the future part of the dataframe which now contains ALL features
     future_df_with_features = temp_history[temp_history['ds'].isin(future_dates)].copy()
     
-    # FIX for Warning 2: Explicitly infer dtypes after filling
+    # The fix is a two-step process: fill the values, then explicitly infer the types.
     future_df_with_features.fillna(0, inplace=True)
-    future_df_with_features = future_df_with_features.infer_objects(copy=False)
+    future_df_with_features = future_df_with_features.infer_objects()
 
     return future_df_with_features
 
