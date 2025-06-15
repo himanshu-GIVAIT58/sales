@@ -6,6 +6,11 @@ from typing import Optional, Dict, Any, List
 import re
 import google.generativeai as genai
 from streamlit_chat import message # You might need to run: pip install streamlit-chat
+import os
+from dotenv import load_dotenv
+import uuid
+
+load_dotenv()
 
 # --- Page Configuration ---
 st.set_page_config(
@@ -19,7 +24,7 @@ st.set_page_config(
 # IMPORTANT: Replace with your actual Gemini API Key.
 # For deployment, use Streamlit Secrets: st.secrets["GEMINI_API_KEY"]
 try:
-    GEMINI_API_KEY = "AIzaSyAnxwxedQhBa07RJSVq6r6BlfpsypVY4nM" # <--- PASTE YOUR KEY HERE
+    GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
     genai.configure(api_key=GEMINI_API_KEY)
     llm_model = genai.GenerativeModel('gemini-1.5-flash')
     CHATBOT_ENABLED = True
@@ -151,12 +156,58 @@ def get_model_performance(sku_data: Dict[str, Any]) -> Dict[str, Dict[str, float
     return performance
 
 def display_main_metrics(sku_data: Dict[str, Any]) -> None:
-    st.subheader("Key Recommendations", divider="blue")
-    cols = st.columns(4)
-    cols[0].metric("Reorder Point", f"{sku_data.get('reorder_point', '0')}")
-    cols[1].metric("Order Quantity (EOQ)", f"{sku_data.get('validated_eoq', '0')}")
-    cols[2].metric("Safety Stock", f"{sku_data.get('safety_stock', '0')}")
-    cols[3].metric("Next 30-Day Forecast", f"{sku_data.get('forecast_next_1_month', 0):,.0f} units")
+    """Displays key performance indicators for inventory and forecast in two rows."""
+    st.subheader("Key Recommendations & Forecasts", divider="blue")
+
+    # --- Row 1: Inventory Metrics (Now with 4 columns) ---
+    # This row focuses on the core inventory management numbers.
+    inv_cols = st.columns(4)
+    inv_cols[0].metric(
+        "Avg. Lead Time",
+        f"{sku_data.get('avg_lead_time', 'N/A')} days",
+        help="The average time in days it takes for an order to arrive."
+    )
+    inv_cols[1].metric(
+        "Safety Stock",
+        f"{sku_data.get('safety_stock', '0')}",
+        help="Buffer stock to mitigate demand variability during the lead time."
+    )
+    inv_cols[2].metric(
+        "Reorder Point",
+        f"{sku_data.get('reorder_point', '0')}",
+        help="Stock level at which to place a new order (Lead Time Demand + Safety Stock)."
+    )
+    inv_cols[3].metric(
+        "Order Quantity (EOQ)",
+        f"{sku_data.get('validated_eoq', '0')}",
+        help="Cost-optimized order size considering MOQ."
+    )
+
+    st.markdown("---") # Visual separator for clarity
+
+    # --- Row 2: Demand Forecasts (Now with 4 columns) ---
+    # This new row displays the forecast accuracy alongside the projected demand.
+    fcst_cols = st.columns(4)
+    fcst_cols[0].metric(
+        "Model Accuracy",
+        f"{sku_data.get('accuracy', 0):.1f}%",
+        help="The accuracy of the champion model on test data (calculated as 100% - WAPE)."
+    )
+    fcst_cols[1].metric(
+        "1-Month Forecast",
+        f"{sku_data.get('forecast_next_1_month', 0):,.0f} units",
+        help="Projected total demand for the next 30 days."
+    )
+    fcst_cols[2].metric(
+        "3-Month Forecast",
+        f"{sku_data.get('forecast_next_3_months', 0):,.0f} units",
+        help="Projected total demand for the next 90 days."
+    )
+    fcst_cols[3].metric(
+        "6-Month Forecast",
+        f"{sku_data.get('forecast_next_6_months', 0):,.0f} units",
+        help="Projected total demand for the next 183 days."
+    )
 
 def display_forecast_chart(daily_df: Optional[pd.DataFrame], hist_avg: float) -> None:
     # This function remains unchanged...
@@ -236,31 +287,38 @@ def main():
         st.info("ℹ️ Awaiting generation of forecasting data. Please ensure the pipeline has run.", icon="⏳")
         return
 
-    # --- NEW: Chatbot UI Section ---
+    # --- Chatbot UI Section ---
     if CHATBOT_ENABLED:
         with st.expander("💬 Chat with your Data Assistant", expanded=False):
             # Initialize chat history in session state
             if "messages" not in st.session_state:
-                st.session_state.messages = []
-                st.session_state.messages.append(
+                st.session_state.messages = [
                     {"role": "assistant", "content": "Hi! How can I help you analyze the forecast data today?"}
-                )
+                ]
 
-            # Display chat messages from history
-            for msg in st.session_state.messages:
-                message(msg["content"], is_user=(msg["role"] == "user"))
+            # --- THE FIX IS HERE ---
+            # Display chat messages from history. Use enumerate to get a unique index for the key.
+            for i, msg in enumerate(st.session_state.messages):
+                message(msg["content"], is_user=(msg["role"] == "user"), key=f"chat_{i}")
 
             # Get user input
             if prompt := st.chat_input("Ask about a specific SKU, e.g., 'What is the reorder point for ER01118?'"):
-                # Add user message to history and display
+                # Add user message to history
                 st.session_state.messages.append({"role": "user", "content": prompt})
-                message(prompt, is_user=True)
+                
+                # Immediately display the new user message with a unique key
+                # We can use the length of the history as a simple unique key for the newest item
+                message(prompt, is_user=True, key=f"chat_{len(st.session_state.messages)}_user")
 
                 # Generate and display assistant response
                 with st.spinner("Analyzing..."):
                     response = get_chatbot_response(prompt, summary_df, daily_df_all)
                     st.session_state.messages.append({"role": "assistant", "content": response})
-                    message(response)
+                    # Display the new assistant message with its own unique key
+                    message(response, key=f"chat_{len(st.session_state.messages)}_assistant")
+                
+                # Rerun the script to clear the input box and show the full new history correctly
+                st.rerun()
     
     st.markdown("---") # Visual separator
 
