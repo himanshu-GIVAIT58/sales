@@ -1,4 +1,4 @@
-# Multi-Model Sales Forecasting Engine for SKU-Level Demand
+# Multi-Model Sales Forecasting And Inventory Management Engine for SKU-Level Demand
 
 ## 1. Project Overview
 
