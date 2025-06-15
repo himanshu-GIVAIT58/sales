@@ -3,6 +3,9 @@ import streamlit as st
 import pandas as pd
 import altair as alt
 from typing import Optional, Dict, Any, List
+import re
+import google.generativeai as genai
+from streamlit_chat import message # You might need to run: pip install streamlit-chat
 
 # --- Page Configuration ---
 st.set_page_config(
@@ -11,6 +14,18 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded"
 )
+
+# --- Chatbot Configuration ---
+# IMPORTANT: Replace with your actual Gemini API Key.
+# For deployment, use Streamlit Secrets: st.secrets["GEMINI_API_KEY"]
+try:
+    GEMINI_API_KEY = "AIzaSyAnxwxedQhBa07RJSVq6r6BlfpsypVY4nM" # <--- PASTE YOUR KEY HERE
+    genai.configure(api_key=GEMINI_API_KEY)
+    llm_model = genai.GenerativeModel('gemini-1.5-flash')
+    CHATBOT_ENABLED = True
+except Exception as e:
+    st.warning(f"⚠️ Gemini API key not configured. Chatbot will be disabled. Error: {e}", icon="🔑")
+    CHATBOT_ENABLED = False
 
 # --- Constants ---
 SUMMARY_FILEPATH = "./home/jupyter/multi_sku_forecasting_final (1).csv"
@@ -29,28 +44,18 @@ MODEL_PREFIXES = {
 # --- Data Loading ---
 @st.cache_data(show_spinner="Loading summary data...")
 def load_summary_data(filepath: str) -> Optional[pd.DataFrame]:
-    """
-    Loads and preprocesses the forecast summary data.
-    """
     try:
         df = pd.read_csv(filepath)
-        # Convert numeric columns
         for col in NUMERIC_COLUMNS:
             if col in df.columns:
                 df[col] = pd.to_numeric(df[col], errors='coerce')
-        
-        # Process datetime and list columns
         df['last_processed_date'] = pd.to_datetime(df['last_processed_date'], errors='coerce')
         for col in ['top_features', 'top_importances']:
             if col in df.columns and isinstance(df[col].iloc[0], str):
                 df[col] = df[col].apply(lambda x: eval(x) if isinstance(x, str) and '[' in x else x)
-        
         return df
     except FileNotFoundError:
-        st.error(
-            f"❌ **File Not Found:** `{filepath}`. Ensure the data file is in the same directory as the script.",
-            icon="🔍"
-        )
+        st.error(f"❌ **File Not Found:** `{filepath}`. Ensure the data file is in the same directory.", icon="🔍")
         return None
     except Exception as e:
         st.error(f"⚠️ An error occurred while loading summary data: {str(e)}", icon="🚨")
@@ -58,29 +63,15 @@ def load_summary_data(filepath: str) -> Optional[pd.DataFrame]:
 
 @st.cache_data(show_spinner="Loading daily forecast data...")
 def load_daily_data(filepath: str) -> Optional[pd.DataFrame]:
-    """
-    Loads and preprocesses the daily forecast data with robust date parsing.
-    """
     try:
         df = pd.read_csv(filepath)
-        # FIX: Explicitly provide the format that matches the data in the file,
-        # including the time component. This is more reliable than inferring.
-        # The format string "%Y-%m-%d %H:%M:%S" exactly matches "2025-05-29 00:00:00".
         df['ds'] = pd.to_datetime(df['ds'], format="%Y-%m-%d %H:%M:%S", errors='coerce')
-
-        # Identify, report, and remove any rows that could not be parsed with the specific format.
         invalid_rows_mask = df['ds'].isna()
         if invalid_rows_mask.any():
-            st.warning(
-                f"⚠️ Found {invalid_rows_mask.sum()} rows with unparseable dates. These rows have been excluded.",
-                icon="📅"
-            )
+            st.warning(f"⚠️ Found {invalid_rows_mask.sum()} rows with unparseable dates, which were excluded.", icon="📅")
             df = df.dropna(subset=['ds'])
-
-        # Normalize to date-only for consistent grouping, if parsing was successful.
         if not df.empty:
             df['ds'] = df['ds'].dt.normalize()
-
         return df
     except FileNotFoundError:
         st.info("ℹ️ Daily forecast file not found. Proceeding without daily data.", icon="📂")
@@ -89,32 +80,86 @@ def load_daily_data(filepath: str) -> Optional[pd.DataFrame]:
         st.error(f"⚠️ Failed to load daily forecast data: {str(e)}", icon="📉")
         return None
 
+# --- Chatbot Helper Functions ---
+def find_sku_in_question(question: str, available_skus: List[str]) -> Optional[str]:
+    """Finds the first valid SKU ID mentioned in the user's question."""
+    question_upper = question.upper()
+    for sku in available_skus:
+        if sku.upper() in question_upper:
+            return sku
+    return None
+
+def get_data_context(sku_id: str, df_summary: pd.DataFrame, df_daily: Optional[pd.DataFrame], forecast_days: int = 30) -> str:
+    """Retrieves and formats all relevant data for a given SKU into a string for the LLM."""
+    summary_data = df_summary[df_summary['sku_id'] == sku_id]
+    if summary_data.empty:
+        return f"Error: No summary data found for SKU '{sku_id}'."
+    summary_data = summary_data.iloc[0]
+
+    daily_data = df_daily[df_daily['sku_id'] == sku_id].head(forecast_days) if df_daily is not None else pd.DataFrame()
+
+    context = f"""
+    Here is the available data for SKU '{sku_id}':
+    - Champion Model: {summary_data.get('final_forecast_model_type', 'N/A')}
+    - Model Accuracy (100 - WAPE): {summary_data.get('accuracy', 0):.2f}%
+    - Reorder Point: {summary_data.get('reorder_point', 'N/A')} units
+    - Safety Stock: {summary_data.get('safety_stock', 'N/A')} units
+    - Next 30-Day Total Forecast: {summary_data.get('forecast_next_1_month', 0):,.0f} units
+    - Next 90-Day Total Forecast: {summary_data.get('forecast_next_3_months', 0):,.0f} units
+    - Daily Forecast for the next {forecast_days} days:
+    {daily_data[['ds', 'yhat']].to_string(index=False) if not daily_data.empty else 'Not available.'}
+    """
+    return context
+
+def get_chatbot_response(question: str, df_summary: pd.DataFrame, df_daily: Optional[pd.DataFrame]) -> str:
+    """Generates a response from the LLM based on the user's question and retrieved data."""
+    available_skus = df_summary['sku_id'].unique().tolist()
+    sku_id = find_sku_in_question(question, available_skus)
+
+    if not sku_id:
+        return f"I'm sorry, I couldn't identify a valid SKU in your question. Please include one of the available SKUs, like `{available_skus[0]}`."
+
+    data_context = get_data_context(sku_id, df_summary, df_daily)
+    if "Error:" in data_context:
+        return data_context
+
+    prompt = f"""
+    You are an expert sales and inventory analyst. Your task is to answer the user's question based *only* on the data provided below.
+    Be concise and clear.
+
+    --- DATA FOR SKU {sku_id} ---
+    {data_context}
+    --- END DATA ---
+
+    User Question: "{question}"
+
+    Your Answer:
+    """
+    try:
+        response = llm_model.generate_content(prompt)
+        return response.text
+    except Exception as e:
+        return f"Sorry, an error occurred with the AI model: {e}"
+
 # --- UI Helper Functions ---
 def get_model_performance(sku_data: Dict[str, Any]) -> Dict[str, Dict[str, float]]:
-    """Extracts performance metrics for all models for a given SKU."""
     performance = {}
     for model_name, prefix in MODEL_PREFIXES.items():
-        rmse_col = f'{prefix}_rmse'
-        wape_col = f'{prefix}_wape'
+        rmse_col, wape_col = f'{prefix}_rmse', f'{prefix}_wape'
         if rmse_col in sku_data and pd.notna(sku_data[rmse_col]):
-            performance[model_name] = {
-                'RMSE': sku_data[rmse_col],
-                'WAPE': sku_data[wape_col]
-            }
+            performance[model_name] = {'RMSE': sku_data[rmse_col], 'WAPE': sku_data[wape_col]}
     return performance
 
 def display_main_metrics(sku_data: Dict[str, Any]) -> None:
-    """Displays key performance indicators for inventory and forecast."""
     st.subheader("Key Recommendations", divider="blue")
-    col1, col2, col3, col4 = st.columns(4)
-
-    col1.metric("Reorder Point", f"{sku_data.get('reorder_point', '0')}", help="Stock level at which to place a new order.")
-    col2.metric("Order Quantity (EOQ)", f"{sku_data.get('validated_eoq', '0')}", help="Cost-optimized order size considering MOQ.")
-    col3.metric("Safety Stock", f"{sku_data.get('safety_stock', '0')}", help="Buffer stock to mitigate demand variability.")
-    col4.metric("Next 30-Day Forecast", f"{sku_data.get('forecast_next_1_month', 0):,.0f} units", help="Projected demand for the upcoming month.")
+    cols = st.columns(4)
+    cols[0].metric("Reorder Point", f"{sku_data.get('reorder_point', '0')}")
+    cols[1].metric("Order Quantity (EOQ)", f"{sku_data.get('validated_eoq', '0')}")
+    cols[2].metric("Safety Stock", f"{sku_data.get('safety_stock', '0')}")
+    cols[3].metric("Next 30-Day Forecast", f"{sku_data.get('forecast_next_1_month', 0):,.0f} units")
 
 def display_forecast_chart(daily_df: Optional[pd.DataFrame], hist_avg: float) -> None:
-    """Renders an interactive forecast chart with confidence intervals."""
+    # This function remains unchanged...
     if daily_df is None or daily_df.empty:
         st.info("ℹ️ No daily forecast data available for visualization.", icon="📊")
         return
@@ -129,12 +174,7 @@ def display_forecast_chart(daily_df: Optional[pd.DataFrame], hist_avg: float) ->
     band = base.mark_area(opacity=0.3, color='#6B7280').encode(
         y=alt.Y('yhat_lower:Q', title='Forecasted Demand (Units)'),
         y2=alt.Y2('yhat_upper:Q'),
-        tooltip=[
-            alt.Tooltip('ds:T', title='Date', format='%Y-%m-%d'),
-            alt.Tooltip('yhat:Q', title='Forecast', format=',.0f'),
-            alt.Tooltip('yhat_lower:Q', title='Lower Bound', format=',.0f'),
-            alt.Tooltip('yhat_upper:Q', title='Upper Bound', format=',.0f')
-        ]
+        tooltip=[alt.Tooltip('ds:T', title='Date', format='%Y-%m-%d'), alt.Tooltip('yhat:Q', title='Forecast', format=',.0f'), alt.Tooltip('yhat_lower:Q', title='Lower Bound', format=',.0f'), alt.Tooltip('yhat_upper:Q', title='Upper Bound', format=',.0f')]
     ).interactive()
 
     forecast_line = base.mark_line(color='#1F2937', size=2).encode(y=alt.Y('yhat:Q'))
@@ -142,25 +182,17 @@ def display_forecast_chart(daily_df: Optional[pd.DataFrame], hist_avg: float) ->
     avg_line = alt.Chart(pd.DataFrame({'y': [hist_avg]})).mark_rule(color='#9CA3AF', strokeDash=[5, 5]).encode(y='y')
     avg_text = avg_line.mark_text(align='left', dx=5, dy=-10, text='Historical Avg', color='#4B5563').encode(y='y')
 
-    chart = alt.layer(band, forecast_line, avg_line, avg_text).properties(
-        title=f'{time_agg} Demand Forecast',
-        height=400
-    ).configure_axis(
-        labelFontSize=12,
-        titleFontSize=14
-    ).configure_title(
-        fontSize=16,
-        anchor='start'
-    )
+    chart = alt.layer(band, forecast_line, avg_line, avg_text).properties(title=f'{time_agg} Demand Forecast', height=400).configure_axis(labelFontSize=12, titleFontSize=14).configure_title(fontSize=16, anchor='start')
 
     st.altair_chart(chart, use_container_width=True)
 
+
 def display_model_deep_dive(sku_data: Dict[str, Any]) -> None:
-    """Displays model performance comparison and feature importances."""
+    # This function remains unchanged...
     performance_data = get_model_performance(sku_data)
     
     if not performance_data:
-        st.info("ℹ️ No model performance data available for this SKU.", icon="�")
+        st.info("ℹ️ No model performance data available for this SKU.", icon="🎯")
         return
 
     perf_df = pd.DataFrame.from_dict(performance_data, orient='index').reset_index().rename(columns={'index': 'Model'})
@@ -195,30 +227,54 @@ def display_model_deep_dive(sku_data: Dict[str, Any]) -> None:
 def main():
     """Main function to orchestrate the Streamlit dashboard."""
     st.title('🔮 SKU Demand & Inventory Dashboard')
-    st.markdown("This interactive dashboard visualizes demand forecasts from a champion-challenger modeling pipeline.")
+    st.markdown("This dashboard visualizes forecasts from a champion-challenger pipeline and provides an AI assistant for analysis.")
 
     summary_df = load_summary_data(SUMMARY_FILEPATH)
     daily_df_all = load_daily_data(DAILY_FILEPATH)
 
     if summary_df is None:
-        st.info("ℹ️ Awaiting generation of forecasting data files. Please ensure the pipeline has run successfully.", icon="⏳")
+        st.info("ℹ️ Awaiting generation of forecasting data. Please ensure the pipeline has run.", icon="⏳")
         return
 
+    # --- NEW: Chatbot UI Section ---
+    if CHATBOT_ENABLED:
+        with st.expander("💬 Chat with your Data Assistant", expanded=False):
+            # Initialize chat history in session state
+            if "messages" not in st.session_state:
+                st.session_state.messages = []
+                st.session_state.messages.append(
+                    {"role": "assistant", "content": "Hi! How can I help you analyze the forecast data today?"}
+                )
+
+            # Display chat messages from history
+            for msg in st.session_state.messages:
+                message(msg["content"], is_user=(msg["role"] == "user"))
+
+            # Get user input
+            if prompt := st.chat_input("Ask about a specific SKU, e.g., 'What is the reorder point for ER01118?'"):
+                # Add user message to history and display
+                st.session_state.messages.append({"role": "user", "content": prompt})
+                message(prompt, is_user=True)
+
+                # Generate and display assistant response
+                with st.spinner("Analyzing..."):
+                    response = get_chatbot_response(prompt, summary_df, daily_df_all)
+                    st.session_state.messages.append({"role": "assistant", "content": response})
+                    message(response)
+    
+    st.markdown("---") # Visual separator
+
+    # --- SKU Selection and Details Section (Original Logic) ---
     with st.sidebar:
         st.header("⚙️ SKU Selection")
         sku_list = sorted(summary_df['sku_id'].unique())
         search_term = st.text_input("Search SKU:", placeholder="Enter SKU ID...")
         filtered_sku_list = [sku for sku in sku_list if search_term.lower() in str(sku).lower()] if search_term else sku_list
         
-        if not filtered_sku_list:
-            st.warning("⚠️ No SKUs match your search criteria.", icon="🔍")
-            selected_sku = None
-        else:
-            selected_sku = st.radio("Select SKU:", filtered_sku_list, index=0, key="sku_select")
+        selected_sku = st.radio("Select SKU:", filtered_sku_list, index=0, key="sku_select") if filtered_sku_list else None
 
     if selected_sku:
-        st.header(f"SKU Analysis: `{selected_sku}`", divider="rainbow")
-        
+        st.header(f"Detailed Analysis for SKU: `{selected_sku}`", divider="rainbow")
         sku_data = summary_df[summary_df['sku_id'] == selected_sku].iloc[0].to_dict()
         daily_data_filtered = daily_df_all[daily_df_all['sku_id'] == selected_sku] if daily_df_all is not None else None
 
@@ -236,6 +292,9 @@ def main():
                 st.dataframe(pd.DataFrame([sku_data]), use_container_width=True)
                 st.subheader("Daily Forecast Data", divider="gray")
                 st.dataframe(daily_data_filtered, use_container_width=True)
+    elif filtered_sku_list:
+        st.info("Please select a SKU from the sidebar to see detailed analysis.", icon="👈")
+
 
 if __name__ == "__main__":
     main()
