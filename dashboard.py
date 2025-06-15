@@ -2,185 +2,240 @@
 import streamlit as st
 import pandas as pd
 import altair as alt
+from typing import Optional, Dict, Any, List
 
 # --- Page Configuration ---
 st.set_page_config(
     page_title="Demand & Inventory Dashboard",
-    page_icon="📦",
+    page_icon="🔮",
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
-# --- App Title ---
-st.title('📦 SKU Demand & Inventory Dashboard')
-st.markdown("This dashboard visualizes demand forecasts and provides inventory policy recommendations for each product SKU.")
+# --- Constants ---
+SUMMARY_FILEPATH = "./home/jupyter/multi_sku_forecasting_final (1).csv"
+DAILY_FILEPATH = "./home/jupyter/daily_forecasts_final (1).csv"
+NUMERIC_COLUMNS = [
+    'rmse', 'mape', 'wape', 'accuracy', 'historical_avg_sales',
+    'tuned_prophet_rmse', 'tuned_prophet_wape', 'lstm_rmse', 'lstm_wape',
+    'xgboost_rmse', 'xgboost_wape'
+]
+MODEL_PREFIXES = {
+    'Tuned Prophet': 'tuned_prophet',
+    'LSTM': 'lstm',
+    'XGBoost': 'xgboost'
+}
 
 # --- Data Loading ---
 @st.cache_data(show_spinner="Loading summary data...")
-def load_summary_data(filepath):
-    """Loads the main forecast summary results."""
+def load_summary_data(filepath: str) -> Optional[pd.DataFrame]:
+    """
+    Loads and preprocesses the forecast summary data.
+    """
     try:
         df = pd.read_csv(filepath)
-        df['last_processed_date'] = pd.to_datetime(df['last_processed_date'])
+        # Convert numeric columns
+        for col in NUMERIC_COLUMNS:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors='coerce')
+        
+        # Process datetime and list columns
+        df['last_processed_date'] = pd.to_datetime(df['last_processed_date'], errors='coerce')
+        for col in ['top_features', 'top_importances']:
+            if col in df.columns and isinstance(df[col].iloc[0], str):
+                df[col] = df[col].apply(lambda x: eval(x) if isinstance(x, str) and '[' in x else x)
+        
         return df
     except FileNotFoundError:
-        st.error(f"❌ Summary file not found: `{filepath}`. Please run the forecasting pipeline first.", icon="🔥")
+        st.error(
+            f"❌ **File Not Found:** `{filepath}`. Ensure the data file is in the same directory as the script.",
+            icon="🔍"
+        )
+        return None
+    except Exception as e:
+        st.error(f"⚠️ An error occurred while loading summary data: {str(e)}", icon="🚨")
         return None
 
 @st.cache_data(show_spinner="Loading daily forecast data...")
-def load_daily_data(filepath):
-    """Loads the detailed daily forecast data."""
+def load_daily_data(filepath: str) -> Optional[pd.DataFrame]:
+    """
+    Loads and preprocesses the daily forecast data with robust date parsing.
+    """
     try:
         df = pd.read_csv(filepath)
-        df['ds'] = pd.to_datetime(df['ds'])
+        # FIX: Explicitly provide the format that matches the data in the file,
+        # including the time component. This is more reliable than inferring.
+        # The format string "%Y-%m-%d %H:%M:%S" exactly matches "2025-05-29 00:00:00".
+        df['ds'] = pd.to_datetime(df['ds'], format="%Y-%m-%d %H:%M:%S", errors='coerce')
+
+        # Identify, report, and remove any rows that could not be parsed with the specific format.
+        invalid_rows_mask = df['ds'].isna()
+        if invalid_rows_mask.any():
+            st.warning(
+                f"⚠️ Found {invalid_rows_mask.sum()} rows with unparseable dates. These rows have been excluded.",
+                icon="📅"
+            )
+            df = df.dropna(subset=['ds'])
+
+        # Normalize to date-only for consistent grouping, if parsing was successful.
+        if not df.empty:
+            df['ds'] = df['ds'].dt.normalize()
+
         return df
     except FileNotFoundError:
-        return None # Don't show an error, as the summary file is the primary one.
+        st.info("ℹ️ Daily forecast file not found. Proceeding without daily data.", icon="📂")
+        return None
+    except Exception as e:
+        st.error(f"⚠️ Failed to load daily forecast data: {str(e)}", icon="📉")
+        return None
 
-# --- Helper Functions for Display ---
+# --- UI Helper Functions ---
+def get_model_performance(sku_data: Dict[str, Any]) -> Dict[str, Dict[str, float]]:
+    """Extracts performance metrics for all models for a given SKU."""
+    performance = {}
+    for model_name, prefix in MODEL_PREFIXES.items():
+        rmse_col = f'{prefix}_rmse'
+        wape_col = f'{prefix}_wape'
+        if rmse_col in sku_data and pd.notna(sku_data[rmse_col]):
+            performance[model_name] = {
+                'RMSE': sku_data[rmse_col],
+                'WAPE': sku_data[wape_col]
+            }
+    return performance
 
-def display_overview(df):
-    """Displays high-level metrics for all SKUs."""
-    st.header("Dashboard Overview", divider="rainbow")
-    
-    total_skus = df['sku_id'].nunique()
-    successful_skus = df[df['error'].isna()]['sku_id'].nunique()
-    ensemble_models = df[df['final_forecast_model_type'] == 'Ensemble']['sku_id'].nunique()
+def display_main_metrics(sku_data: Dict[str, Any]) -> None:
+    """Displays key performance indicators for inventory and forecast."""
+    st.subheader("Key Recommendations", divider="blue")
+    col1, col2, col3, col4 = st.columns(4)
 
-    col1, col2, col3 = st.columns(3)
-    col1.metric("Total SKUs Processed", f"{total_skus}")
-    col2.metric("SKUs with Successful Forecasts", f"{successful_skus}", delta=f"{((successful_skus/total_skus)*100):.1f}%")
-    col3.metric("SKUs using Ensemble Model", f"{ensemble_models}", delta=f"{((ensemble_models/total_skus)*100):.1f}%")
+    col1.metric("Reorder Point", f"{sku_data.get('reorder_point', '0')}", help="Stock level at which to place a new order.")
+    col2.metric("Order Quantity (EOQ)", f"{sku_data.get('validated_eoq', '0')}", help="Cost-optimized order size considering MOQ.")
+    col3.metric("Safety Stock", f"{sku_data.get('safety_stock', '0')}", help="Buffer stock to mitigate demand variability.")
+    col4.metric("Next 30-Day Forecast", f"{sku_data.get('forecast_next_1_month', 0):,.0f} units", help="Projected demand for the upcoming month.")
 
-
-def display_inventory_metrics(sku_data):
-    """Renders the inventory policy recommendation card."""
-    st.subheader("🔑 Inventory Policy")
-    with st.container(border=True):
-        if pd.notna(sku_data.get('error')):
-            st.warning(f"Could not generate inventory metrics. **Reason:** {sku_data['error']}")
-        else:
-            col1, col2, col3, col4 = st.columns(4)
-            col1.metric(
-                label="Reorder Point (Units)",
-                value=f"{sku_data.get('reorder_point', 0):,.0f}",
-                help="When on-hand stock reaches this level, place a new order."
-            )
-            col2.metric(
-                label="Order Quantity (EOQ)",
-                value=f"{sku_data.get('validated_eoq', 0):,.0f}",
-                help="The recommended order size, optimized for cost and MOQ."
-            )
-            col3.metric(
-                label="Safety Stock (Units)",
-                value=f"{sku_data.get('safety_stock', 0):,.0f}",
-                help="Buffer stock to prevent stockouts from demand or supply variability."
-            )
-            col4.metric(
-                label="Avg. Lead Time (Days)",
-                value=f"{sku_data.get('avg_lead_time', 'N/A')}",
-                help="The average supplier lead time used for calculations."
-            )
-            
-            # Display model type and last processed date
-            model_type = sku_data.get('final_forecast_model_type', 'Prophet')
-            last_date = sku_data['last_processed_date'].strftime('%d %b %Y')
-            st.info(f"**Model Used:** `{model_type}` | **Last Processed Date:** `{last_date}`", icon="🤖")
-
-            with st.expander("Learn about these inventory terms"):
-                st.markdown("""
-                - **Reorder Point (ROP):** The inventory level that triggers a replenishment order. It's calculated as `(Forecasted Daily Demand × Lead Time) + Safety Stock`.
-                - **Economic Order Quantity (EOQ):** The ideal order quantity a company should purchase to minimize inventory costs such as holding costs, shortage costs, and order costs.
-                - **Safety Stock:** Extra quantity of a product which is stored in the warehouse to prevent an out-of-stock situation.
-                """)
-
-def display_forecast_totals(sku_data):
-    """Renders the demand forecast totals card."""
-    st.subheader("📈 Demand Forecast")
-    with st.container(border=True):
-        if pd.notna(sku_data.get('error')):
-            st.warning("Could not generate demand forecasts.")
-        else:
-            # Use st.container() to create a row layout
-            with st.container():
-                st.metric("Next 1 Month Forecast", f"{sku_data.get('forecast_next_1_month', 0):,.0f} units")
-                st.metric("Next 3 Months Forecast", f"{sku_data.get('forecast_next_3_months', 0):,.0f} units")
-                st.metric("Next 6 Months Forecast", f"{sku_data.get('forecast_next_6_months', 0):,.0f} units")
-
-def display_forecast_chart(daily_df):
-    """Renders the interactive forecast chart."""
-    st.subheader("📊 Forecast Visualization")
-    
+def display_forecast_chart(daily_df: Optional[pd.DataFrame], hist_avg: float) -> None:
+    """Renders an interactive forecast chart with confidence intervals."""
     if daily_df is None or daily_df.empty:
-        st.info("No detailed daily forecast data is available to plot for this SKU.")
+        st.info("ℹ️ No daily forecast data available for visualization.", icon="📊")
         return
 
-    with st.container(border=True):
-        time_agg = st.radio(
-            "View forecast by:",
-            ["Daily", "Weekly", "Monthly"],
-            horizontal=True,
-            label_visibility="collapsed"
-        )
-        
-        # Resample data based on selection
-        resample_rule = {'Daily': 'D', 'Weekly': 'W-MON', 'Monthly': 'MS'}[time_agg]
-        chart_df = daily_df.set_index('ds').resample(resample_rule).sum().reset_index()
+    time_agg = st.radio("Aggregate by:", ["Daily", "Weekly", "Monthly"], horizontal=True, index=1, key="time_agg")
+    
+    resample_rule = {'Daily': 'D', 'Weekly': 'W-MON', 'Monthly': 'MS'}[time_agg]
+    chart_df = daily_df.set_index('ds').resample(resample_rule).sum().reset_index()
 
-        # Create Altair chart
-        base = alt.Chart(chart_df).encode(x=alt.X('ds:T', title='Date'))
-        
-        forecast_line = base.mark_line(point=True, color='#0068c9').encode(
-            y=alt.Y('yhat:Q', title='Forecasted Demand (Units)'),
-            tooltip=[
-                alt.Tooltip('ds:T', title='Date'),
-                alt.Tooltip('yhat:Q', title='Forecast', format=',.0f')
-            ]
-        )
-        
-        # In this example, yhat_lower/upper are not in daily data, so we only plot the main forecast
-        # If they were present, a confidence band could be added like this:
-        # band = base.mark_area(opacity=0.3).encode(y='yhat_lower:Q', y2='yhat_upper:Q')
-        # chart = band + forecast_line
-        
-        st.altair_chart(forecast_line.interactive(), use_container_width=True)
+    base = alt.Chart(chart_df).encode(x=alt.X('ds:T', title='Date'))
+    
+    band = base.mark_area(opacity=0.3, color='#6B7280').encode(
+        y=alt.Y('yhat_lower:Q', title='Forecasted Demand (Units)'),
+        y2=alt.Y2('yhat_upper:Q'),
+        tooltip=[
+            alt.Tooltip('ds:T', title='Date', format='%Y-%m-%d'),
+            alt.Tooltip('yhat:Q', title='Forecast', format=',.0f'),
+            alt.Tooltip('yhat_lower:Q', title='Lower Bound', format=',.0f'),
+            alt.Tooltip('yhat_upper:Q', title='Upper Bound', format=',.0f')
+        ]
+    ).interactive()
 
+    forecast_line = base.mark_line(color='#1F2937', size=2).encode(y=alt.Y('yhat:Q'))
+    
+    avg_line = alt.Chart(pd.DataFrame({'y': [hist_avg]})).mark_rule(color='#9CA3AF', strokeDash=[5, 5]).encode(y='y')
+    avg_text = avg_line.mark_text(align='left', dx=5, dy=-10, text='Historical Avg', color='#4B5563').encode(y='y')
+
+    chart = alt.layer(band, forecast_line, avg_line, avg_text).properties(
+        title=f'{time_agg} Demand Forecast',
+        height=400
+    ).configure_axis(
+        labelFontSize=12,
+        titleFontSize=14
+    ).configure_title(
+        fontSize=16,
+        anchor='start'
+    )
+
+    st.altair_chart(chart, use_container_width=True)
+
+def display_model_deep_dive(sku_data: Dict[str, Any]) -> None:
+    """Displays model performance comparison and feature importances."""
+    performance_data = get_model_performance(sku_data)
+    
+    if not performance_data:
+        st.info("ℹ️ No model performance data available for this SKU.", icon="�")
+        return
+
+    perf_df = pd.DataFrame.from_dict(performance_data, orient='index').reset_index().rename(columns={'index': 'Model'})
+    
+    col1, col2 = st.columns(2)
+
+    with col1:
+        st.subheader("Model Performance Comparison", divider="gray")
+        perf_melted = perf_df.melt(id_vars='Model', var_name='Metric', value_name='Value')
+        chart = alt.Chart(perf_melted).mark_bar().encode(
+            x=alt.X('Value:Q', title=None),
+            y=alt.Y('Model:N', sort='-x', title=None),
+            color=alt.Color('Model:N', scale=alt.Scale(scheme='category10'), legend=None),
+            row=alt.Row('Metric:N', title=None, header=alt.Header(labelAngle=0, labelAlign='left'))
+        ).properties(height=150).configure_facet(spacing=10)
+        st.altair_chart(chart, use_container_width=True)
+
+    with col2:
+        st.subheader("Feature Importance (XGBoost)", divider="gray")
+        if sku_data.get('final_forecast_model_type') == 'XGBoost' and sku_data.get('top_features'):
+            imp_df = pd.DataFrame({'Feature': sku_data['top_features'], 'Importance': sku_data['top_importances']})
+            imp_chart = alt.Chart(imp_df).mark_bar().encode(
+                x=alt.X('Importance:Q', title='Importance Score'),
+                y=alt.Y('Feature:N', sort='-x', title=None),
+                color=alt.Color(value='#4B5563')
+            ).properties(height=340)
+            st.altair_chart(imp_chart, use_container_width=True)
+        else:
+            st.info("ℹ️ Feature importance available only for XGBoost champion model.", icon="📋")
 
 # --- Main Application ---
-summary_df = load_summary_data("./home/jupyter/multi_sku_forecasting_final.csv")
-daily_df_all = load_daily_data("./home/jupyter/daily_forecasts_final.csv")
+def main():
+    """Main function to orchestrate the Streamlit dashboard."""
+    st.title('🔮 SKU Demand & Inventory Dashboard')
+    st.markdown("This interactive dashboard visualizes demand forecasts from a champion-challenger modeling pipeline.")
 
-if summary_df is not None:
-    # --- Sidebar for SKU Selection ---
-    st.sidebar.header("⚙️ Select SKU")
-    sku_list = sorted(summary_df['sku_id'].unique())
-    selected_sku = st.sidebar.selectbox(
-        "Choose an SKU to analyze:", sku_list, index=0
-    )
-    
-    # --- Main Content Area ---
-    display_overview(summary_df)
-    
-    st.header(f"Analysis for SKU: `{selected_sku}`", divider="rainbow")
+    summary_df = load_summary_data(SUMMARY_FILEPATH)
+    daily_df_all = load_daily_data(DAILY_FILEPATH)
 
-    # Filter data for the selected SKU
-    sku_data = summary_df[summary_df['sku_id'] == selected_sku].iloc[0]
-    
-    if daily_df_all is not None:
-        daily_data_filtered = daily_df_all[daily_df_all['sku_id'] == selected_sku]
-    else:
-        daily_data_filtered = None
+    if summary_df is None:
+        st.info("ℹ️ Awaiting generation of forecasting data files. Please ensure the pipeline has run successfully.", icon="⏳")
+        return
 
-    # Display components
-    col_left, col_right = st.columns([1, 1])
-    with col_left:
-        display_inventory_metrics(sku_data)
-    with col_right:
-        display_forecast_totals(sku_data)
+    with st.sidebar:
+        st.header("⚙️ SKU Selection")
+        sku_list = sorted(summary_df['sku_id'].unique())
+        search_term = st.text_input("Search SKU:", placeholder="Enter SKU ID...")
+        filtered_sku_list = [sku for sku in sku_list if search_term.lower() in str(sku).lower()] if search_term else sku_list
+        
+        if not filtered_sku_list:
+            st.warning("⚠️ No SKUs match your search criteria.", icon="🔍")
+            selected_sku = None
+        else:
+            selected_sku = st.radio("Select SKU:", filtered_sku_list, index=0, key="sku_select")
 
-    st.markdown("---") # Visual separator
-    display_forecast_chart(daily_data_filtered)
+    if selected_sku:
+        st.header(f"SKU Analysis: `{selected_sku}`", divider="rainbow")
+        
+        sku_data = summary_df[summary_df['sku_id'] == selected_sku].iloc[0].to_dict()
+        daily_data_filtered = daily_df_all[daily_df_all['sku_id'] == selected_sku] if daily_df_all is not None else None
 
-else:
-    st.info("Awaiting the generation of the forecasting data file...")
-    st.image("https://media.giphy.com/media/v1.Y2lkPTc5MGI3NjExd2RtcXBmNWp5N2VlZ3RsbDVud2Z2OWs0c2hsZDNtMm5pZzY5d2FndCZlcD12MV9pbnRlcm5hbF9naWZfYnlfaWQmY3Q9Zw/l0HlBOJaAgDqfKAfS/giphy.gif")
+        if pd.notna(sku_data.get('error')):
+            st.error(f"⚠️ Processing error for this SKU: **{sku_data['error']}**", icon="🚨")
+        else:
+            display_main_metrics(sku_data)
+            tab1, tab2, tab3 = st.tabs(["📈 Forecast Visualization", "🧠 Model Insights", "📋 Data Details"])
+            with tab1:
+                display_forecast_chart(daily_data_filtered, sku_data.get('historical_avg_sales', 0))
+            with tab2:
+                display_model_deep_dive(sku_data)
+            with tab3:
+                st.subheader("Forecast Summary", divider="gray")
+                st.dataframe(pd.DataFrame([sku_data]), use_container_width=True)
+                st.subheader("Daily Forecast Data", divider="gray")
+                st.dataframe(daily_data_filtered, use_container_width=True)
+
+if __name__ == "__main__":
+    main()
