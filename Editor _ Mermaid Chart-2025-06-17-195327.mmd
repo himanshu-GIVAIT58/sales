@@ -1,0 +1,77 @@
+graph TD
+    subgraph Initial Setup
+        A["<b>Start</b><br>Purpose: Initiate the forecasting pipeline."] --> B["<b>Configure Settings</b><br>Load global config (e.g., thresholds, model params).<br>Purpose: Define parameters for consistent execution."]
+        B --> C["<b>Verify GPU</b><br>Check for GPU availability and configure TensorFlow.<br>Purpose: Optimize deep learning performance."]
+    end
+
+    subgraph Data Loading
+        C --> D["<b>Load Data</b><br>Read sales, inventory, holidays, store count CSVs.<br>Purpose: Gather raw data for forecasting."]
+        D --> E["<b>Clean Data</b><br>Convert dates, clean numeric fields, handle NaNs.<br>Purpose: Ensure data quality and consistency."]
+    end
+
+    subgraph Store Growth Preparation
+        E --> F["<b>Generate Store Growth</b><br>Create daily store count by interpolating monthly data.<br>Purpose: Account for store expansion in forecasts."]
+    end
+
+    subgraph SKU Clustering
+        F --> G["<b>Perform SKU Clustering</b><br>Use TimeSeries K-Means with DTW to group SKUs.<br>Purpose: Identify similar demand patterns for analysis."]
+    end
+
+    subgraph SKU Selection
+        G --> H["<b>Determine SKUs to Process</b><br>Check for new data since last run.<br>Purpose: Focus on SKUs needing updates."]
+    end
+
+    subgraph SKU Processing
+        H --> I["<b>Process Each SKU</b><br>Iterate over selected SKUs in parallel.<br>Purpose: Generate forecasts for each SKU."]
+        I --> J["<b>Prepare SKU Data</b><br>Merge with store growth, aggregate daily sales, clip outliers, interpolate missing values.<br>Purpose: Create clean, consistent time series."]
+        J --> K["<b>Calculate SKU Attributes</b><br>Compute historical metrics (mean, std, zero ratio, ACF).<br>Purpose: Characterize SKU demand patterns."]
+        K --> L["<b>Check Data Sufficiency</b><br>Assess if data is enough or demand is sporadic.<br>Purpose: Decide forecasting approach."]
+        L -->|Insufficient/Sporadic| M["<b>Run SMA Forecast</b><br>Use simple moving average for 183 days.<br>Purpose: Provide basic forecast for low-data SKUs."]
+        L -->|Sufficient| N["<b>Engineer Features</b><br>Add lags, rolling stats, cyclic encodings, promotion flags.<br>Purpose: Enhance model inputs with time-series features."]
+        N --> O["<b>Split Train/Test</b><br>Use last 30 days as test set.<br>Purpose: Evaluate model performance on recent data."]
+        O --> P["<b>Evaluate Models</b><br>Test Prophet, XGBoost, LSTM, CNN-LSTM, Transformer.<br>Purpose: Compare model accuracy using RMSE, MAPE, WAPE."]
+        P --> Q["<b>Tune Prophet</b><br>Optimize changepoint and seasonality scales.<br>Purpose: Improve Prophet's fit to data."]
+        P --> R["<b>Tune XGBoost</b><br>Optimize hyperparameters with Optuna.<br>Purpose: Enhance XGBoost performance."]
+        P --> S["<b>Tune Deep Learning</b><br>Optimize LSTM, CNN-LSTM, Transformer with Keras Tuner.<br>Purpose: Find best deep learning configurations."]
+        Q --> T["<b>Select Champion Model</b><br>Choose best model or ensemble based on RMSE·MAPE.<br>Purpose: Identify most accurate forecasting approach."]
+        R --> T
+        S --> T
+        T --> U["<b>Generate Forecasts</b><br>Predict 183 days with quantiles for champion/ensemble.<br>Purpose: Produce future demand estimates."]
+        U --> V["<b>Calculate SHAP Values</b><br>Compute feature importance for XGBoost.<br>Purpose: Explain model predictions."]
+        V --> W["<b>Calculate Inventory Metrics</b><br>Compute safety stock, EOQ, reorder point.<br>Purpose: Support inventory planning."]
+        W --> X["<b>Save Results</b><br>Store forecasts, metrics, models to CSV and disk.<br>Purpose: Persist outputs for analysis and use."]
+        M --> X
+    end
+
+    subgraph Future Enhancements
+        X -.-> Y["<b>Monitor Model</b><br>Track performance metrics in production.<br>Purpose: Detect data drift and model degradation."]
+        Y -.-> Z["<b>Automate Retraining</b><br>Schedule periodic model updates.<br>Purpose: Keep forecasts current with new data."]
+        Z -.-> AA["<b>Deploy API</b><br>Serve forecasts via REST API.<br>Purpose: Enable real-time access for applications."]
+        AA -.-> AB["<b>Scale Computation</b><br>Use Dask/Spark for large datasets.<br>Purpose: Handle increased data volume efficiently."]
+        AB -.-> AC["<b>Create Feature Store</b><br>Centralize feature engineering.<br>Purpose: Ensure consistency across models."]
+        AC -.-> AD["<b>Build Dashboard</b><br>Visualize forecasts and SHAP values.<br>Purpose: Improve stakeholder understanding."]
+        AD -.-> AE["<b>Add Anomaly Detection</b><br>Flag unusual demand patterns.<br>Purpose: Enhance forecast reliability."]
+        AE -.-> AF["<b>Integrate Cloud</b><br>Deploy on AWS/GCP with CI/CD.<br>Purpose: Achieve scalability and automation."]
+    end
+
+    X --> AG["<b>End</b><br>Purpose: Complete the forecasting pipeline."]
+
+    %% Model Subgraphs
+    P -->|Uses| ProphetModel["<b>Prophet Model</b><br>Structure: Additive model with trend, seasonality, holidays, regressors.<br>Parameters:<br>- yearly_seasonality=True, daily_seasonality=True<br>- Monthly seasonality (period=30.5, fourier_order=5)<br>- Regressors: store_count, was_stocked_out, is_on_promotion, discount_percentage, sales_lag_7d, rolling_avg_sales_7d<br>- Tuning: changepoint_prior_scale=[0.01, 0.1, 0.5], seasonality_prior_scale=[1.0, 5.0, 10.0]<br>Purpose: Model time-series trends and seasonality."]
+    P -->|Uses| XGBoostModel["<b>XGBoost Model</b><br>Structure: Ensemble of decision trees with gradient boosting.<br>Parameters:<br>- Objective: reg:squarederror<br>- Tuning (Optuna, 20 trials):<br>  - n_estimators: 50–200<br>  - learning_rate: 0.01–0.3 (log)<br>  - max_depth: 3–10<br>  - min_child_weight: 1–10<br>  - subsample: 0.5–1.0<br>  - colsample_bytree: 0.5–1.0<br>  - random_state=42<br>- Early stopping: 10 rounds<br>Purpose: Capture complex patterns with tree-based feature interactions."]
+    P -->|Uses| LSTMModel["<b>LSTM Model</b><br>Structure: Two LSTM layers, dropout, dense output.<br>Parameters:<br>- Input shape: (n_steps=30, num_features)<br>- Tuning (RandomSearch, 5 trials, 2 executions):<br>  - units_1, units_2: 50–200 (step 50)<br>  - dropout: 0.1–0.5 (step 0.1)<br>  - learning_rate: 1e-4–1e-2 (log)<br>- Optimizer: Adam, Loss: MSE<br>- Epochs: 50, Batch size: 32<br>- Validation split: 0.2, Early stopping (patience=5)<br>Purpose: Model sequential dependencies in time-series."]
+    P -->|Uses| CNNLSTMModel["<b>CNN-LSTM Model</b><br>Structure: Conv1D, MaxPooling1D, two LSTM layers, dropout, dense output.<br>Parameters:<br>- Input shape: (n_steps=30, num_features)<br>- Tuning (RandomSearch, 5 trials, 2 executions):<br>  - filters: 32–128 (step 32)<br>  - kernel_size: 3–7 (step 2)<br>  - units_1, units_2: 50–150 (step 50)<br>  - dropout: 0.1–0.5 (step 0.1)<br>  - learning_rate: 1e-4–1e-2 (log)<br>- Optimizer: Adam, Loss: MSE<br>- Epochs: 50, Batch size: 32<br>- Validation split: 0.2, Early stopping (patience=5)<br>Purpose: Combine convolutional feature extraction with LSTM temporal modeling."]
+    P -->|Uses| TransformerModel["<b>Transformer Model</b><br>Structure: Multi-head attention, layer normalization, feed-forward layers, global average pooling, dense output.<br>Parameters:<br>- Input shape: (n_steps=30, num_features)<br>- Tuning (RandomSearch, 5 trials, 1 execution):<br>  - num_transformer_blocks: 1–3<br>  - head_size: 64–256 (step 64)<br>  - num_heads: 2–4<br>  - ff_dim: 64–256 (step 64)<br>  - dropout: 0.1–0.4 (step 0.1)<br>  - dense_units: 20–100 (step 20)<br>  - dropout_final: 0.1–0.4 (step 0.1)<br>  - learning_rate: 1e-4–1e-2 (log)<br>- Optimizer: Adam, Loss: MSE<br>- Epochs: 60, Batch size: 16<br>- Validation split: 0.2, Early stopping (patience=5)<br>Purpose: Capture long-range dependencies with attention mechanisms."]
+
+    classDef startEnd fill:#90EE90,stroke:#000,stroke-width:2px;
+    classDef process fill:#ADD8E6,stroke:#000,stroke-width:1px;
+    classDef sma fill:#F08080,stroke:#000,stroke-width:1px;
+    classDef eval fill:#FFFFE0,stroke:#000,stroke-width:1px;
+    classDef future fill:#D3D3D3,stroke:#000,stroke-dasharray:5,5;
+    classDef model fill:#FFB6C1,stroke:#000,stroke-width:1px;
+    class A,AG startEnd;
+    class B,C,D,E,F,G,H,I,J,K,L,N,O,P,Q,R,S,T,U,V,W,X process;
+    class M sma;
+    class P eval;
+    class Y,Z,AA,AB,AC,AD,AE,AF future;
+    class ProphetModel,XGBoostModel,LSTMModel,CNNLSTMModel,TransformerModel model;
